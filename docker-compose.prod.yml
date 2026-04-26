@@ -1,0 +1,91 @@
+# Production stack for meshcore-mqtt-broker.
+#
+# Usage:
+#   1. cp .env.example .env  &&  edit values (SUBSCRIBER_*, AUTH_EXPECTED_AUDIENCE, TUNNEL_TOKEN, ...)
+#   2. docker compose -f docker-compose.prod.yml up -d
+#   3. In the Cloudflare Zero Trust dashboard, point the tunnel's public hostname
+#      at the service URL  http://broker:8883  (Docker DNS resolves the service name
+#      on the internal network shared with cloudflared).
+
+services:
+  broker:
+    # Replace <owner> with your GHCR namespace, or comment this line and uncomment `build:` for local builds.
+    image: ghcr.io/greentown0/meshcore-mqtt-broker:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: meshcore-mqtt-broker
+    restart: unless-stopped
+    init: true                                            # PID 1 reaper; clean SIGTERM forwarding to node.
+    env_file: .env                                        # SUBSCRIBER_*, AUTH_*, ABUSE_*, MQTT_*
+    environment:
+      ABUSE_PERSISTENCE_PATH: /data/abuse-detection.db    # forced — must point at the writable volume
+    volumes:
+      - broker_data:/data                                 # SQLite DB + WAL/SHM siblings live here
+    networks: [internal]
+    read_only: true                                       # rootfs is immutable
+    tmpfs:
+      - /tmp:size=16M,mode=1777                           # safety net for any lib that touches os.tmpdir()
+    cap_drop: [ALL]                                       # port 8883 > 1024, no caps needed
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1.0"
+        reservations:
+          memory: 64M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "-e", "require('net').createConnection(Number(process.env.MQTT_WS_PORT)||8883,'127.0.0.1').on('connect',function(){this.end();process.exit(0)}).on('error',function(){process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    ports:
+      - "8883:8883"  # Optional: expose MQTT port directly (not needed if using cloudflared tunnel)
+
+  cloudflared:
+    # Pin to a specific release in production. See https://github.com/cloudflare/cloudflared/releases
+    image: cloudflare/cloudflared:latest
+    container_name: meshcore-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?TUNNEL_TOKEN must be set in .env}
+    networks: [internal]
+    depends_on:
+      broker:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16M,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  broker_data:

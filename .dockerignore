@@ -1,0 +1,35 @@
+# VCS
+.git
+.gitignore
+.github
+
+# Local secrets and runtime data
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Build artifacts (rebuilt inside the image)
+node_modules
+dist
+
+# Docs and ancillary files
+docs
+prompts.txt
+LICENSE.md
+*.md
+!README.md
+
+# OS / editor
+.DS_Store
+.vscode
+.idea
+
+# Docker artifacts (don't recurse them into the build context)
+Dockerfile
+.dockerignore
+docker-compose*.yml

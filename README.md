@@ -175,6 +175,23 @@ The build process will:
 
 For setting up with TLS using Cloudflare Tunnels, see [docs/cloudflare-tunnels.md](docs/cloudflare-tunnels.md). This is the recommended way to deploy the MQTT broker.
 
+### Docker (production)
+
+A hardened multi-stage `Dockerfile` and a `docker-compose.prod.yml` are provided. The compose stack runs the broker on a distroless, non-root, read-only-rootfs container alongside a `cloudflared` sidecar that fronts it with TLS via a Cloudflare Tunnel.
+
+```bash
+cp .env.example .env
+# Fill in SUBSCRIBER_*, AUTH_EXPECTED_AUDIENCE, ABUSE_*, and TUNNEL_TOKEN.
+
+docker compose -f docker-compose.prod.yml up -d
+```
+
+In the Cloudflare Zero Trust dashboard, point the tunnel's public hostname at the service URL `http://broker:8883` (Docker DNS resolves the service name on the internal network shared with cloudflared). See [docs/cloudflare-tunnels.md](docs/cloudflare-tunnels.md) for the full tunnel walkthrough.
+
+Persistence: the abuse-detection SQLite database lives in the `broker_data` named volume mounted at `/data`. Everything else in the container is read-only.
+
+Images are also published to GHCR by `.github/workflows/docker-publish.yml` on pushes to `main` and on `v*.*.*` tags (multi-arch: `linux/amd64`, `linux/arm64`).
+
 
 ## License
 
