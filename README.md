@@ -1,6 +1,19 @@
 # meshcore-mqtt-broker
 
-A WebSocket-based MQTT broker with MeshCore public key authentication.
+This is a fork of the WebSocket-based MQTT broker with MeshCore public key authentication that adds dockerization and automatic building of the docker image.
+
+## Docker
+
+ See the [docker-compose.prod.yml](https://github.com/greentown0/meshcore-mqtt-broker/blob/main/docker-compose.prod.yml) for how to use it.
+
+To start using
+```
+cp .env.example .env
+```
+
+ Edit `.env` as necessary, changing the default passwords.
+
+ `cloudflared` is built into the stack for ease of use. You must add your cloudflare tunnel id to the `.env` file.
 
 ## Features
 
