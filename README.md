@@ -11,9 +11,11 @@ To start using
 cp .env.example .env
 ```
 
- Edit `.env` as necessary, changing the default passwords.
+ Edit `.env` as necessary (SUBSCRIBER_*, AUTH_EXPECTED_AUDIENCE, TUNNEL_TOKEN).
 
  `cloudflared` is built into the stack for ease of use. You must add your cloudflare tunnel id to the `.env` file.
+
+ In the Cloudflare Zero Trust dashboard, point the tunnel's public hostname at the service URL `http://broker:8883`  (Docker DNS resolves the service name on the internal network shared with cloudflared).
 
 ## Features
 
