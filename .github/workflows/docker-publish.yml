@@ -4,8 +4,22 @@ on:
   push:
     branches: [main]
     tags: ["v*.*.*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".gitignore"
+      - ".github/FUNDING.yml"
+      - "prompts.txt"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".gitignore"
+      - ".github/FUNDING.yml"
+      - "prompts.txt"
   workflow_dispatch:
 
 env:
