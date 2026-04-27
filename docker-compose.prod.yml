@@ -10,7 +10,7 @@
 services:
   broker:
     # Replace <owner> with your GHCR namespace, or comment this line and uncomment `build:` for local builds.
-    image: ghcr.io/Dutch-MeshCore/meshcore-mqtt-broker:latest
+    image: ghcr.io/dutch-meshcore/collector:latest
     # build:
     #   context: .
     #   dockerfile: Dockerfile
