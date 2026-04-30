@@ -2,7 +2,7 @@ name: Build and publish container image
 
 on:
   push:
-    branches: [main]
+    branches: [feature\collector-stats]
     tags: ["v*.*.*"]
     paths-ignore:
       - "**.md"
@@ -12,7 +12,7 @@ on:
       - ".github/FUNDING.yml"
       - "prompts.txt"
   pull_request:
-    branches: [main]
+    branches: [feature\collector-stats]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -24,7 +24,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository }}:stats
 
 jobs:
   build:
