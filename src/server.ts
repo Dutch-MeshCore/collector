@@ -1,5 +1,4 @@
 import Aedes from 'aedes';
-import os from 'node:os';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
@@ -52,51 +51,6 @@ const subscriberMaxConnections = new Map<string, number>();
 
 // Track active connections per subscriber username
 const subscriberActiveConnections = new Map<string, Set<string>>();
-
-const STATS_TOPIC_PREFIX = process.env.STATS_TOPIC_PREFIX || 'stats';
-const COLLECTOR_NAME =
-  process.env.COLLECTOR_NAME ||
-  process.env.AUTH_EXPECTED_AUDIENCE ||
-  os.hostname();
-
-const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || '30000', 10);
-const STATS_TOPIC = `${STATS_TOPIC_PREFIX}/${COLLECTOR_NAME}/subscribers`;
-
-function buildSubscriberStats() {
-  const subscribers = Array.from(subscriberActiveConnections.entries()).map(
-    ([username, connections]) => ({
-      username,
-      connections: connections.size,
-    })
-  );
-
-  return {
-    collector: COLLECTOR_NAME,
-    ts: new Date().toISOString(),
-    subscriber_count: subscribers.reduce((sum, s) => sum + s.connections, 0),
-    subscribers,
-  };
-}
-
-function publishSubscriberStats() {
-  const payload = JSON.stringify(buildSubscriberStats());
-
-  aedes.publish(
-    {
-      topic: STATS_TOPIC,
-      payload,
-      qos: 0,
-      retain: true,
-    },
-    (err?: Error | null) => {
-      if (err) {
-        console.error('[STATS] publish failed:', err);
-      } else {
-        console.log(`[STATS] published -> ${STATS_TOPIC}`);
-      }
-    }
-  );
-}
 
 let subscriberIndex = 1;
 while (true) {
@@ -159,13 +113,6 @@ if (subscriberUsers.size === 0) {
 // Create Aedes MQTT broker
 const aedes = new Aedes();
 
-//create interval
-publishSubscriberStats();
-
-setInterval(() => {
-  publishSubscriberStats();
-}, STATS_INTERVAL_MS);
-
 // Rate limiting for failed connections
 const rateLimiter = new RateLimiter(60000, 10, 300000);
 
@@ -211,9 +158,6 @@ aedes.authenticate = async (client, username, password, callback) => {
         // Track this connection
         activeConns.add(client.id);
         subscriberActiveConnections.set(usernameStr, activeConns);
-
-        //publish subscriber stats
-        publishSubscriberStats();
         
         const role = subscriberRoles.get(usernameStr) || SubscriberRole.LIMITED;
         console.log(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role}, connections: ${activeConns.size}/${maxConn})`);
@@ -842,7 +786,6 @@ aedes.on('clientDisconnect', (client) => {
       const activeConns = subscriberActiveConnections.get(username);
       if (activeConns) {
         activeConns.delete(client.id);
-        publishSubscriberStats();
         const maxConn = subscriberMaxConnections.get(username) || subscriberConfig.defaultMaxConnections;
         console.log(`${logPrefix} [CLIENT] Subscriber connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
       }
