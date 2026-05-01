@@ -111,6 +111,7 @@ function publishCollectorStats(): void {
 
   aedes.publish(
     {
+      cmd: 'publish',
       topic,
       payload,
       qos: 0,
