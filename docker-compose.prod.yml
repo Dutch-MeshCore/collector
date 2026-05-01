@@ -20,6 +20,7 @@ services:
     env_file: .env                                        # SUBSCRIBER_*, AUTH_*, ABUSE_*, MQTT_*
     environment:
       ABUSE_PERSISTENCE_PATH: /data/abuse-detection.db    # forced — must point at the writable volume
+      COLLECTOR_NAME: ${COLLECTOR_NAME:-set_collector_name_in_.env}  # optional, but recommended for better audit logs in abuse detection
     volumes:
       - broker_data:/data                                 # SQLite DB + WAL/SHM siblings live here
     networks: [internal]
