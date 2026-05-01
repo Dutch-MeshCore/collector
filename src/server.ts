@@ -51,7 +51,79 @@ const subscriberMaxConnections = new Map<string, number>();
 
 // Track active connections per subscriber username
 const subscriberActiveConnections = new Map<string, Set<string>>();
+// Collector stats config
+const COLLECTOR_NAME = process.env.COLLECTOR_NAME || 'collector';
+const STATS_TOPIC_PREFIX = process.env.STATS_TOPIC_PREFIX || 'stats';
+const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || '30000', 10);
 
+// Track detailed connected subscriber clients for stats
+type ConnectedSubscriber = {
+  clientId: string;
+  username: string;
+  role: SubscriberRole;
+  roleName: string;
+  connectedAt: number;
+  ip?: string;
+};
+
+const connectedSubscribers = new Map<string, ConnectedSubscriber>();
+
+function getSubscriberRoleName(role: SubscriberRole): string {
+  if (role === SubscriberRole.ADMIN) return 'admin';
+  if (role === SubscriberRole.FULL_ACCESS) return 'full_access';
+  return 'limited';
+}
+
+function cleanTopicPart(value: string): string {
+  return value.replace(/^\/+|\/+$/g, '');
+}
+
+function getStatsTopic(): string {
+  const prefix = cleanTopicPart(STATS_TOPIC_PREFIX);
+  const collectorName = cleanTopicPart(COLLECTOR_NAME);
+  return `${prefix}/${collectorName}/connected_clients`;
+}
+
+function buildCollectorStatsPayload() {
+  const now = Date.now();
+
+  const subscribers = Array.from(connectedSubscribers.values()).map((subscriber) => ({
+    username: subscriber.username,
+    client_id: subscriber.clientId,
+    role: subscriber.roleName,
+    ip: subscriber.ip,
+    connected_at: new Date(subscriber.connectedAt).toISOString(),
+    connected_seconds: Math.floor((now - subscriber.connectedAt) / 1000),
+  }));
+
+  return {
+    collector: COLLECTOR_NAME,
+    timestamp: new Date(now).toISOString(),
+    connected_subscriber_count: subscribers.length,
+    connected_subscribers: subscribers,
+    excluded: 'token authenticated publisher clients are not included',
+  };
+}
+
+function publishCollectorStats(): void {
+  const topic = getStatsTopic();
+  const payload = Buffer.from(JSON.stringify(buildCollectorStatsPayload()));
+
+  aedes.publish(
+    {
+      topic,
+      payload,
+      qos: 0,
+      retain: true,
+      dup: false,
+    },
+    (err) => {
+      if (err) {
+        console.error(`[STATS] Failed to publish stats to ${topic}:`, err);
+      }
+    }
+  );
+}
 let subscriberIndex = 1;
 while (true) {
   const subscriberEnvVar = process.env[`SUBSCRIBER_${subscriberIndex}`];
@@ -164,6 +236,15 @@ aedes.authenticate = async (client, username, password, callback) => {
         (client as any).clientType = ClientType.SUBSCRIBER;
         (client as any).username = usernameStr;
         (client as any).role = role;
+
+        connectedSubscribers.set(client.id, {
+          clientId: client.id,
+          username: usernameStr,
+          role,
+          roleName: getSubscriberRoleName(role),
+          connectedAt: Date.now(),
+          ip: (client as any).conn?.clientIP,
+        });
         
         // Mark stream as authenticated
         const stream = (client as any).conn;
@@ -789,6 +870,7 @@ aedes.on('clientDisconnect', (client) => {
         const maxConn = subscriberMaxConnections.get(username) || subscriberConfig.defaultMaxConnections;
         console.log(`${logPrefix} [CLIENT] Subscriber connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
       }
+      connectedSubscribers.delete(client.id);
     }
   }
 });
@@ -961,7 +1043,11 @@ wsServer.on('connection', (ws, req) => {
     }
   }
 });
+setInterval(publishCollectorStats, STATS_INTERVAL_MS);
 
+setTimeout(publishCollectorStats, 1000);
+
+console.log(`[STATS] Publishing collector stats every ${STATS_INTERVAL_MS}ms to ${getStatsTopic()}`);
 httpServer.listen(WS_PORT, HOST, () => {
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║         MeshCore MQTT Broker (WebSocket)                  ║');
