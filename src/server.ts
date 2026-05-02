@@ -2,6 +2,7 @@ import Aedes from 'aedes';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
+import os from 'os';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter';
@@ -52,7 +53,24 @@ const subscriberMaxConnections = new Map<string, number>();
 // Track active connections per subscriber username
 const subscriberActiveConnections = new Map<string, Set<string>>();
 // Collector stats config
-const COLLECTOR_NAME = process.env.COLLECTOR_NAME || 'collector';
+function resolveCollectorName(): string {
+  const envCollectorName = (process.env.COLLECTOR_NAME || '').trim();
+  if (
+    envCollectorName &&
+    envCollectorName !== 'set_collector_name_in_.env' &&
+    envCollectorName !== 'collector-1'
+  ) {
+    return envCollectorName;
+  }
+
+  if (EXPECTED_AUDIENCE && EXPECTED_AUDIENCE.trim()) {
+    return EXPECTED_AUDIENCE.trim();
+  }
+
+  return os.hostname();
+}
+
+const COLLECTOR_NAME = resolveCollectorName();
 const STATS_TOPIC_PREFIX = process.env.STATS_TOPIC_PREFIX || 'stats';
 const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || '30000', 10);
 const STATS_INCLUDE_TOKEN_CLIENT_DETAILS = (process.env.STATS_INCLUDE_TOKEN_CLIENT_DETAILS || 'false').toLowerCase() === 'true';
@@ -944,9 +962,9 @@ aedes.on('clientDisconnect', (client) => {
 });
 
 aedes.on('publish', (packet, client) => {
-  if (client) {
-    const payloadBytes = packet.payload ? packet.payload.length : 0;
+  const payloadBytes = packet.payload ? packet.payload.length : 0;
 
+  if (client) {
     statsCounters.messagesReceivedTotal++;
     statsCounters.messagesReceivedBytesTotal += payloadBytes;
     statsCounters.messagesReceivedSinceLastStats++;
@@ -959,7 +977,7 @@ aedes.on('publish', (packet, client) => {
     const logPrefix = getClientLogPrefix(client);
     console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${payloadBytes} bytes)`);
   } else {
-    console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
+    console.log(`[PUBLISH] Internal -> ${packet.topic} (${payloadBytes} bytes)`);
   }
 });
 
