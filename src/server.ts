@@ -51,11 +51,13 @@ const subscriberMaxConnections = new Map<string, number>();
 
 // Track active connections per subscriber username
 const subscriberActiveConnections = new Map<string, Set<string>>();
+
 // Collector stats config
 const COLLECTOR_NAME = process.env.COLLECTOR_NAME || 'collector';
 const STATS_TOPIC_PREFIX = process.env.STATS_TOPIC_PREFIX || 'stats';
 const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || '30000', 10);
 const STATS_RETAIN = (process.env.STATS_RETAIN || 'true').toLowerCase() === 'true';
+const STATS_INCLUDE_TOKEN_CLIENT_DETAILS = (process.env.STATS_INCLUDE_TOKEN_CLIENT_DETAILS || 'false').toLowerCase() === 'true';
 
 // Track detailed connected subscriber clients for stats
 type ConnectedSubscriber = {
@@ -67,7 +69,17 @@ type ConnectedSubscriber = {
   ip?: string;
 };
 
+// Track token-authenticated publisher clients for stats
+type ConnectedTokenClient = {
+  clientId: string;
+  publicKeyShort: string;
+  audience?: string;
+  connectedAt: number;
+  ip?: string;
+};
+
 const connectedSubscribers = new Map<string, ConnectedSubscriber>();
+const connectedTokenClients = new Map<string, ConnectedTokenClient>();
 
 function getSubscriberRoleName(role: SubscriberRole): string {
   if (role === SubscriberRole.ADMIN) return 'admin';
@@ -97,13 +109,30 @@ function buildCollectorStatsPayload() {
     connected_seconds: Math.floor((now - subscriber.connectedAt) / 1000),
   }));
 
-  return {
+  const tokenClients = Array.from(connectedTokenClients.values()).map((tokenClient) => ({
+    client_id: tokenClient.clientId,
+    public_key_short: tokenClient.publicKeyShort,
+    ip: tokenClient.ip,
+    audience: tokenClient.audience,
+    connected_at: new Date(tokenClient.connectedAt).toISOString(),
+    connected_seconds: Math.floor((now - tokenClient.connectedAt) / 1000),
+  }));
+
+  const payload: any = {
     collector: COLLECTOR_NAME,
     timestamp: new Date(now).toISOString(),
     connected_subscriber_count: subscribers.length,
     connected_subscribers: subscribers,
-    excluded: 'token authenticated publisher clients are not included',
+    connected_token_client_count: tokenClients.length,
   };
+
+  if (STATS_INCLUDE_TOKEN_CLIENT_DETAILS) {
+    payload.connected_token_clients = tokenClients;
+  } else {
+    payload.excluded = 'token authenticated publisher clients are not included';
+  }
+
+  return payload;
 }
 
 function publishCollectorStats(): void {
@@ -126,6 +155,7 @@ function publishCollectorStats(): void {
     }
   );
 }
+
 let subscriberIndex = 1;
 while (true) {
   const subscriberEnvVar = process.env[`SUBSCRIBER_${subscriberIndex}`];
@@ -313,6 +343,14 @@ aedes.authenticate = async (client, username, password, callback) => {
     (client as any).publicKey = publicKey;
     (client as any).tokenPayload = tokenPayload;
     (client as any).clientType = ClientType.PUBLISHER;
+
+    connectedTokenClients.set(client.id, {
+      clientId: client.id,
+      publicKeyShort: shortKey,
+      audience: tokenPayload.aud,
+      connectedAt: Date.now(),
+      ip: (client as any).conn?.clientIP,
+    });
     
     // Mark stream as authenticated
     const stream = (client as any).conn;
@@ -874,6 +912,10 @@ aedes.on('clientDisconnect', (client) => {
       }
       connectedSubscribers.delete(client.id);
     }
+
+    if (clientType === ClientType.PUBLISHER) {
+      connectedTokenClients.delete(client.id);
+    }
   }
 });
 
@@ -1045,11 +1087,12 @@ wsServer.on('connection', (ws, req) => {
     }
   }
 });
-setInterval(publishCollectorStats, STATS_INTERVAL_MS);
 
+setInterval(publishCollectorStats, STATS_INTERVAL_MS);
 setTimeout(publishCollectorStats, 1000);
 
-console.log(`[STATS] Publishing collector stats every ${STATS_INTERVAL_MS}ms to ${getStatsTopic()} (retain: ${STATS_RETAIN})`);
+console.log(`[STATS] Publishing collector stats every ${STATS_INTERVAL_MS}ms to ${getStatsTopic()} (retain: ${STATS_RETAIN}, token details: ${STATS_INCLUDE_TOKEN_CLIENT_DETAILS})`);
+
 httpServer.listen(WS_PORT, HOST, () => {
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║         MeshCore MQTT Broker (WebSocket)                  ║');
