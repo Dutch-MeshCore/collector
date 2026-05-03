@@ -4,7 +4,7 @@ This is a fork of the WebSocket-based MQTT broker with MeshCore public key authe
 
 ## Docker
 
- See the [docker-compose.prod.yml](https://github.com/Dutch-MeshCore/collector/blob/main/docker-compose.yml) for how to use it.
+ See the [docker-compose.yml](https://github.com/Dutch-MeshCore/collector/blob/main/docker-compose.yml) for how to use it.
 
  A quick start is:
 
