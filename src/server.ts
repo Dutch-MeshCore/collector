@@ -57,7 +57,8 @@ const COLLECTOR_NAME = process.env.COLLECTOR_NAME || 'collector';
 const STATS_TOPIC_PREFIX = process.env.STATS_TOPIC_PREFIX || 'stats';
 const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || '30000', 10);
 const STATS_RETAIN = (process.env.STATS_RETAIN || 'true').toLowerCase() === 'true';
-const STATS_INCLUDE_TOKEN_CLIENT_DETAILS = (process.env.STATS_INCLUDE_TOKEN_CLIENT_DETAILS || 'false').toLowerCase() === 'true';
+const STATS_INCLUDE_TOKEN_CLIENT_DETAILS =
+  (process.env.STATS_INCLUDE_TOKEN_CLIENT_DETAILS || 'false').toLowerCase() === 'true';
 
 // Track detailed connected subscriber clients for stats
 type ConnectedSubscriber = {
@@ -80,6 +81,14 @@ type ConnectedTokenClient = {
 
 const connectedSubscribers = new Map<string, ConnectedSubscriber>();
 const connectedTokenClients = new Map<string, ConnectedTokenClient>();
+
+// Message counters for collector stats
+let messagesReceivedTotal = 0;
+let messagesReceivedBytesTotal = 0;
+let meshcoreMessagesReceivedTotal = 0;
+let messagesReceivedSinceLastStats = 0;
+let messagesReceivedBytesSinceLastStats = 0;
+let lastStatsPublishedAt = Date.now();
 
 function getSubscriberRoleName(role: SubscriberRole): string {
   if (role === SubscriberRole.ADMIN) return 'admin';
@@ -118,12 +127,22 @@ function buildCollectorStatsPayload() {
     connected_seconds: Math.floor((now - tokenClient.connectedAt) / 1000),
   }));
 
+  const elapsedSeconds = Math.max((now - lastStatsPublishedAt) / 1000, 0.001);
+  const messagesPerSecond = messagesReceivedSinceLastStats / elapsedSeconds;
+
   const payload: any = {
     collector: COLLECTOR_NAME,
     timestamp: new Date(now).toISOString(),
     connected_subscriber_count: subscribers.length,
     connected_subscribers: subscribers,
     connected_token_client_count: tokenClients.length,
+
+    messages_received_total: messagesReceivedTotal,
+    messages_received_bytes_total: messagesReceivedBytesTotal,
+    meshcore_messages_received_total: meshcoreMessagesReceivedTotal,
+    messages_received_since_last_stats: messagesReceivedSinceLastStats,
+    messages_received_bytes_since_last_stats: messagesReceivedBytesSinceLastStats,
+    messages_received_per_second: Math.round(messagesPerSecond * 100) / 100,
   };
 
   if (STATS_INCLUDE_TOKEN_CLIENT_DETAILS) {
@@ -131,6 +150,10 @@ function buildCollectorStatsPayload() {
   } else {
     payload.excluded = 'token authenticated publisher clients are not included';
   }
+
+  messagesReceivedSinceLastStats = 0;
+  messagesReceivedBytesSinceLastStats = 0;
+  lastStatsPublishedAt = now;
 
   return payload;
 }
@@ -923,6 +946,19 @@ aedes.on('publish', (packet, client) => {
   if (client) {
     const logPrefix = getClientLogPrefix(client);
     console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
+
+    const clientType = (client as any).clientType;
+    if (clientType === ClientType.PUBLISHER) {
+      const payloadLength = packet.payload?.length || 0;
+      messagesReceivedTotal += 1;
+      messagesReceivedBytesTotal += payloadLength;
+      messagesReceivedSinceLastStats += 1;
+      messagesReceivedBytesSinceLastStats += payloadLength;
+
+      if (packet.topic.startsWith('meshcore/')) {
+        meshcoreMessagesReceivedTotal += 1;
+      }
+    }
   } else {
     console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
   }
