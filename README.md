@@ -4,18 +4,25 @@ This is a fork of the WebSocket-based MQTT broker with MeshCore public key authe
 
 ## Docker
 
- See the [docker-compose.prod.yml](https://github.com/Dutch-MeshCore/collector/blob/main/docker-compose.prod.yml) for how to use it.
+ See the [docker-compose.prod.yml](https://github.com/Dutch-MeshCore/collector/blob/main/docker-compose.yml) for how to use it.
 
-To start using
+ A quick start is:
+
 ```
+mkdir ~/collector
+cd ~/collector
+wget https://raw.githubusercontent.com/Dutch-MeshCore/collector/refs/heads/main/docker-compose.yml
+wget https://raw.githubusercontent.com/Dutch-MeshCore/collector/refs/heads/main/.env.example
 cp .env.example .env
 ```
 
- Edit `.env` as necessary (SUBSCRIBER_*, AUTH_EXPECTED_AUDIENCE, TUNNEL_TOKEN).
+Edit `.env` as necessary (SUBSCRIBER_*, AUTH_EXPECTED_AUDIENCE, TUNNEL_TOKEN).
 
- `cloudflared` is built into the stack for ease of use. You must add your cloudflare tunnel id to the `.env` file.
+`cloudflared` is built into the stack for ease of use. You must add your cloudflare tunnel id to the `.env` file.
 
- In the Cloudflare Zero Trust dashboard, point the tunnel's public hostname at the service URL `http://broker:8883`  (Docker DNS resolves the service name on the internal network shared with cloudflared).
+In the Cloudflare Zero Trust dashboard, point the tunnel's public hostname at the service URL `http://broker:8883`  (Docker DNS resolves the service name on the internal network shared with cloudflared).
+
+Then run it with `docker-compose up -d` or in newer versions `docker compose up -d`
 
 ## Features
 
