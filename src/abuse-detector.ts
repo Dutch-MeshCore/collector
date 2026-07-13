@@ -1,6 +1,18 @@
 import { createHash } from 'crypto';
 import Database from 'better-sqlite3';
 
+// Cap the per-client anomaly log. Without a bound, chronically noisy clients
+// accumulate multi-MB logs that the synchronous 5-minute save cycle must
+// JSON.stringify, stalling the event loop long enough to flap subscriber
+// keepalives. anomalyCount (a counter) still tracks the lifetime total.
+const MAX_STORED_ANOMALIES = 100;
+
+// Peak-rate tracking window. Only the last 10s (current rate) and last hour
+// (peak decay) are ever read, so anything past an hour is dead weight.
+const RATE_WINDOW_MS = 3600000;
+// Defensive bound on the per-client timestamp array (10 pkt/s for a full hour)
+const MAX_RATE_WINDOW_ENTRIES = 36000;
+
 // ============================================================================
 // Type Definitions
 // ============================================================================
@@ -128,7 +140,10 @@ export interface AbuseConfig {
   // Persistence
   persistencePath: string;
   persistenceIntervalMs: number;
-  
+  // Trust state is retained only for clients active within this window; older state is
+  // evicted from memory and disk on each save so the store stays bounded by active clients.
+  stateRetentionMs: number;
+
   // Enforcement
   enforcementEnabled: boolean;
 }
@@ -239,17 +254,19 @@ export class AbuseDetector {
   }
 
   private loadFromDatabase(): void {
-    const stmt = this.db.prepare('SELECT public_key, state_json FROM trust_states');
-    const rows = stmt.all() as { public_key: string; state_json: string }[];
-    
+    // Only load state for clients active within the retention window, and iterate rather than
+    // materialising the whole table, so a large historical DB can never exhaust the heap on load.
+    const cutoff = Date.now() - this.config.stateRetentionMs;
+    const stmt = this.db.prepare('SELECT public_key, state_json FROM trust_states WHERE updated_at >= ?');
+
     let loaded = 0;
-    for (const row of rows) {
+    for (const row of stmt.iterate(cutoff) as Iterable<{ public_key: string; state_json: string }>) {
       try {
         const serialized: SerializedTrustState = JSON.parse(row.state_json);
         const state = this.deserializeTrustState(serialized);
         this.clients.set(row.public_key, state);
         loaded++;
-        
+
         if (state.status === 'muted') {
           this.stats.totalClientsMuted++;
         }
@@ -257,7 +274,7 @@ export class AbuseDetector {
         console.error(`[ABUSE] Failed to load trust state for ${row.public_key}:`, error);
       }
     }
-    
+
     console.log(`[ABUSE] Loaded ${loaded} trust states from database`);
   }
 
@@ -266,22 +283,38 @@ export class AbuseDetector {
       INSERT OR REPLACE INTO trust_states (public_key, state_json, updated_at)
       VALUES (?, ?, ?)
     `);
-    
+
+    const del = this.db.prepare('DELETE FROM trust_states WHERE public_key = ?');
     const now = Date.now();
+    const cutoff = now - this.config.stateRetentionMs;
     let saved = 0;
-    
+    let evicted = 0;
+
     for (const [publicKey, state] of this.clients.entries()) {
+      // Evict clients idle beyond the retention window from memory and disk so the store stays
+      // bounded by active clients rather than every client ever seen.
+      if (state.lastPacketAt < cutoff) {
+        this.clients.delete(publicKey);
+        del.run(publicKey);
+        evicted++;
+        continue;
+      }
       try {
         const serialized = this.serializeTrustState(state);
-        stmt.run(publicKey, JSON.stringify(serialized), now);
+        // Persist the client's real last-activity time as updated_at so retention (load filter
+        // and the delete below) is driven by activity, not by when the row was last written.
+        stmt.run(publicKey, JSON.stringify(serialized), state.lastPacketAt);
         saved++;
       } catch (error) {
         console.error(`[ABUSE] Failed to save trust state for ${publicKey}:`, error);
       }
     }
-    
-    if (saved > 0) {
-      console.log(`[ABUSE] Saved ${saved} trust states to database`);
+
+    // Sweep any orphaned rows for clients not currently tracked in memory (bounds disk).
+    this.db.prepare('DELETE FROM trust_states WHERE updated_at < ?').run(cutoff);
+
+    if (saved > 0 || evicted > 0) {
+      console.log(`[ABUSE] Saved ${saved} trust states to database (evicted ${evicted} stale)`);
     }
   }
 
@@ -335,11 +368,23 @@ export class AbuseDetector {
     // Initialize peakRateWindow if missing
     if (!state.peakRateWindow || !state.peakRateWindow.version || state.peakRateWindow.version < 1) {
       state.peakRateWindow = {
-        version: 1,
+        version: 2,
         packets: [],
-        windowMs: 86400000,
+        windowMs: RATE_WINDOW_MS,
       };
       state.peakRateObserved = 0; // Reset bad old values
+    }
+
+    // v1 -> v2: shrink the rate window from 24h to 1h. Rate checks only ever
+    // read the last 10s (current rate) and last hour (peak decay), but the 24h
+    // window stored a timestamp per packet - the bulk of the persisted state.
+    if (state.peakRateWindow.version < 2) {
+      const cutoff = Date.now() - RATE_WINDOW_MS;
+      state.peakRateWindow.packets = state.peakRateWindow.packets.filter(
+        (timestamp: number) => timestamp > cutoff
+      );
+      state.peakRateWindow.windowMs = RATE_WINDOW_MS;
+      state.peakRateWindow.version = 2;
     }
     
     // Reset clock tracking if version is old or missing
@@ -351,7 +396,13 @@ export class AbuseDetector {
       state.anomalyCount = 0;
       state.anomalies = [];
     }
-    
+
+    // Trim anomaly logs persisted before the cap existed (multi-MB rows made
+    // the synchronous save cycle stall the event loop)
+    if (state.anomalies.length > MAX_STORED_ANOMALIES) {
+      state.anomalies = state.anomalies.slice(-MAX_STORED_ANOMALIES);
+    }
+
     return state;
   }
 
@@ -422,9 +473,9 @@ export class AbuseDetector {
       avgPacketSize: 0,
       peakRateObserved: 0,
       peakRateWindow: {
-        version: 1,
+        version: 2,
         packets: [],
-        windowMs: 86400000, // 24 hours
+        windowMs: RATE_WINDOW_MS,
       },
     };
 
@@ -509,11 +560,14 @@ export class AbuseDetector {
     // Track packet rate over 24h window
     state.peakRateWindow.packets.push(now);
     
-    // Clean old packets outside 24h window
+    // Clean old packets outside the window
     const windowStart = now - state.peakRateWindow.windowMs;
     state.peakRateWindow.packets = state.peakRateWindow.packets.filter(
       (timestamp: number) => timestamp > windowStart
     );
+    if (state.peakRateWindow.packets.length > MAX_RATE_WINDOW_ENTRIES) {
+      state.peakRateWindow.packets = state.peakRateWindow.packets.slice(-MAX_RATE_WINDOW_ENTRIES);
+    }
     
     // Calculate current rate (packets in last 10 seconds)
     const tenSecondsAgo = now - 10000;
@@ -755,6 +809,12 @@ export class AbuseDetector {
       details,
       timestamp: Date.now(),
     });
+
+    // Keep only the most recent entries - anomalyCount carries the total for
+    // threshold checks, so the log is purely diagnostic
+    if (state.anomalies.length > MAX_STORED_ANOMALIES) {
+      state.anomalies.shift();
+    }
 
     console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] Anomaly: ${type} - ${details}`);
 
