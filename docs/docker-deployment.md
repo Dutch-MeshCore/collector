@@ -126,22 +126,30 @@ The Node one-liner opens a TCP socket to `MQTT_WS_PORT` on `127.0.0.1`, exits 0 
 - Use the host network and expose 8883 directly. Forces operators to handle TLS themselves at L7 (nginx, caddy) and drops the existing Cloudflare-tunnel deployment story.
 - Use a volume-based tunnel credentials file instead of `TUNNEL_TOKEN`. Token mode is simpler — operators can rotate via the Cloudflare dashboard without touching the host filesystem.
 
-### D8. Resource limits and log rotation
+### D8. Autoheal for unhealthy broker containers
 
-**Choice:** broker capped at 256M memory / 1.0 CPU; cloudflared at 128M / 0.5 CPU. Both use `json-file` driver with `max-size: 10m, max-file: 3`.
+**Choice:** only the broker carries the `autoheal=true` label. The autoheal service checks for unhealthy labeled containers every five seconds and restarts the broker when Docker marks it unhealthy. The collector image deliberately remains on `:latest`; the autoheal image is pinned to an immutable multi-platform digest.
+
+**Why:** Docker health checks only report status and `restart: unless-stopped` only reacts when the main process exits. Autoheal supplies the missing health-status-to-restart behavior without changing the broker application.
+
+**Security:** the watcher needs read-write access to `/var/run/docker.sock` in order to issue the restart. It is isolated from the network, runs with a read-only root filesystem and all Linux capabilities dropped, and selects only explicitly labeled containers.
+
+### D9. Resource limits and log rotation
+
+**Choice:** broker capped at 256M memory / 1.0 CPU; cloudflared at 128M / 0.5 CPU. All services use `json-file` with `max-size: 10m, max-file: 3`.
 
 **Why:**
 - Memory: The broker is mostly in-memory state (rate-limiter Map, abuse-detection working set). 64M reservation, 256M ceiling is comfortable for thousands of clients without permitting runaway leaks.
 - CPU: The broker is I/O-bound (WebSocket frames, JWT verify). 1 CPU is generous; the limit is there to prevent any one container from saturating the host under attack.
 - Logs: the app logs heavily on auth and abuse events. Without rotation, a busy broker fills the host disk with `*-json.log` files. 30 MB rotated retention keeps recent events around without being a footgun.
 
-### D9. Secrets via `env_file: .env`, not Docker secrets
+### D10. Secrets via `env_file: .env`, not Docker secrets
 
 **Choice:** `docker-compose.prod.yml` uses `env_file: .env`. Subscriber credentials (`SUBSCRIBER_N=user:pass:role:max`), `AUTH_EXPECTED_AUDIENCE`, and `TUNNEL_TOKEN` all live in that file.
 
 **Why:** Docker Swarm secrets (file-based, mounted at `/run/secrets/<name>`) would be a stronger story — they keep secrets off process env, off `docker inspect` output, and out of `/proc/<pid>/environ`. But the application reads everything via `process.env` and `dotenv.config()`. Switching to Docker secrets would require code changes (read each secret from a file path, fall back to env). That's beyond the current scope. `.env` with `chmod 600` is the practical choice — match the project's existing configuration model and document it.
 
-### D10. GitHub Actions: multi-arch, attested, built only on push
+### D11. GitHub Actions: multi-arch, attested, built only on push
 
 **Choice:** `.github/workflows/docker-publish.yml` builds on `push` to `main` and on `v*.*.*` tags, runs on `pull_request` for build verification (no push), publishes to `ghcr.io/${{ github.repository }}` with `linux/amd64` + `linux/arm64`, and attaches SBOM + provenance attestations via `docker/build-push-action@v6` plus `actions/attest-build-provenance@v2`.
 
@@ -168,7 +176,7 @@ The setup was verified end-to-end during implementation:
    ```
 4. **Healthcheck:** transitions from `starting` to `healthy` after the first probe (verified at t≈25s).
 5. **Volume initialization:** the named volume is populated with `/data` owned by `65532:65532 0755`, and the broker creates `abuse-detection.db` (mode `0644`, same owner). Persistence survives container restart (volume is detached from container lifetime).
-6. **Compose validation:** `docker compose -f docker-compose.prod.yml config` resolves cleanly with both services, the internal network, and the named volume.
+6. **Compose validation:** `docker compose -f docker-compose.prod.yml config` resolves cleanly with all three services, the internal network, and the named volume.
 
 ## Operator notes
 
@@ -224,7 +232,7 @@ If the broker hits the 256M memory ceiling under load, expect to tune two things
 1. `deploy.resources.limits.memory` in compose.
 2. The abuse-detector working set: `ABUSE_TOPIC_HISTORY_SIZE`, `ABUSE_DUPLICATE_WINDOW_SIZE`, and the per-client trust state retention. These all scale with active client count.
 
-The healthcheck and `restart: unless-stopped` together mean the container will be recycled automatically on OOM kill, but data in `/data` is preserved across restarts.
+An OOM kill terminates the broker and activates `restart: unless-stopped`. A health-check failure instead activates autoheal once Docker marks the broker unhealthy. Data in `/data` is preserved in both cases.
 
 ## Known limitations
 
@@ -240,7 +248,7 @@ The healthcheck and `restart: unless-stopped` together mean the container will b
 |---|---|
 | `Dockerfile` | Multi-stage build: glibc builder + distroless runtime, non-root, tsx-at-runtime, TCP healthcheck. |
 | `.dockerignore` | Keeps `.env`, `dist/`, `node_modules`, secrets, and docs out of the build context. |
-| `docker-compose.prod.yml` | Two-service stack: hardened broker + `cloudflared` sidecar on a private bridge. |
+| `docker-compose.prod.yml` | Three-service stack: hardened broker, autoheal watcher, and `cloudflared` sidecar. |
 | `.env.example` | Template for runtime configuration; includes `TUNNEL_TOKEN` for the sidecar. |
 | `.github/workflows/docker-publish.yml` | Multi-arch build + push to GHCR with SBOM and provenance. |
 | `docs/cloudflare-tunnels.md` | Existing operator guide for setting up the tunnel side. |

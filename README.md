@@ -199,7 +199,7 @@ For setting up with TLS using Cloudflare Tunnels, see [docs/cloudflare-tunnels.m
 
 ### Docker (production)
 
-A hardened multi-stage `Dockerfile` and a `docker-compose.prod.yml` are provided. The compose stack runs the broker on a distroless, non-root, read-only-rootfs container alongside a `cloudflared` sidecar that fronts it with TLS via a Cloudflare Tunnel.
+A hardened multi-stage `Dockerfile` and a `docker-compose.prod.yml` are provided. The compose stack runs the broker on a distroless, non-root, read-only-rootfs container alongside a `cloudflared` sidecar that fronts it with TLS via a Cloudflare Tunnel. A label-scoped autoheal watcher restarts the broker when Docker marks it unhealthy.
 
 ```bash
 cp .env.example .env
