@@ -13,6 +13,7 @@ on:
       - ".gitignore"
       - ".github/FUNDING.yml"
       - "prompts.txt"
+      - "docker-compose*.yml"
   pull_request:
     branches: [main]
     paths-ignore:
@@ -22,6 +23,7 @@ on:
       - ".gitignore"
       - ".github/FUNDING.yml"
       - "prompts.txt"
+      - "docker-compose*.yml"
   workflow_dispatch:
 
 env:

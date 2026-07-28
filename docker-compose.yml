@@ -16,6 +16,9 @@ services:
     #   dockerfile: Dockerfile
     container_name: meshcore-mqtt-broker
     restart: unless-stopped
+    labels:
+      autoheal: "true"
+      autoheal.stop.timeout: "30"
     init: true                                            # PID 1 reaper; clean SIGTERM forwarding to node.
     env_file: .env                                        # SUBSCRIBER_*, AUTH_*, ABUSE_*, MQTT_*
     environment:
@@ -53,6 +56,28 @@ services:
       start_period: 20s
     ports:
       - "8883:8883"  # Optional: expose MQTT port directly (not needed if using cloudflared tunnel)
+
+  autoheal:
+    # Pinned to the multi-platform digest published for willfarrell/autoheal:latest on 2026-07-28.
+    image: willfarrell/autoheal:latest@sha256:e513881f029803a9214bed90e88a16fbe945dd4c0876bbdf037f29d12b55f8e5
+    container_name: meshcore-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "5"
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "30"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   cloudflared:
     # Pin to a specific release in production. See https://github.com/cloudflare/cloudflared/releases
