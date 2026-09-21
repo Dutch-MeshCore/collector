@@ -214,6 +214,8 @@ Persistence: the abuse-detection SQLite database lives in the `broker_data` name
 
 Images are also published to GHCR by `.github/workflows/docker-publish.yml` on pushes to `main` and on `v*.*.*` tags (multi-arch: `linux/amd64`, `linux/arm64`).
 
+To update a running collector to a newer image, see [docs/updating-the-container.md](docs/updating-the-container.md).
+
 
 ## License
 
