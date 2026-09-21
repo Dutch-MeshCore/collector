@@ -15,6 +15,16 @@ function validateRequiredEnvVars(vars: string[]): void {
   }
 }
 
+// parseRegionList parses PUBLISH_EXTRA_REGIONS (comma-separated) into a lowercase
+// Set of non-IATA stream-region labels accepted in the topic region slot, in
+// addition to real IATA codes and "test". When the var is unset it defaults to
+// wardriver,hunter (this is the wardrive-enabled build); set it explicitly (even
+// to empty) to override.
+function parseRegionList(v: string | undefined): Set<string> {
+  const raw = v === undefined ? 'wardriver,hunter' : v;
+  return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+
 // Validate and load MQTT configuration
 export function loadMqttConfig() {
   validateRequiredEnvVars([
@@ -27,6 +37,9 @@ export function loadMqttConfig() {
     wsPort: parseInt(process.env.MQTT_WS_PORT!),
     host: process.env.MQTT_HOST!,
     expectedAudience: process.env.AUTH_EXPECTED_AUDIENCE!,
+    // Non-IATA stream-region labels (e.g. wardriver, hunter) publishers may use in
+    // the topic region slot. Gated as sensitive on the subscribe side.
+    extraPublishRegions: parseRegionList(process.env.PUBLISH_EXTRA_REGIONS),
   };
 }
 
