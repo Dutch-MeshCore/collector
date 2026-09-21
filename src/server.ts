@@ -21,6 +21,9 @@ const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
 // broker only speaks MQTT-over-WS, so a human hitting the URL is sent to the
 // front-end. Configurable; defaults to the DMC observers site.
 const HTTP_REDIRECT_URL = process.env.HTTP_REDIRECT_URL || 'https://observers.dutchmeshcore.nl/';
+// Non-IATA stream-region labels (e.g. wardriver, hunter) accepted in the topic
+// region slot alongside real IATA codes and "test". Kept lowercase.
+const EXTRA_PUBLISH_REGIONS = mqttConfig.extraPublishRegions;
 
 // Helper function to validate IATA airport codes
 function isValidIATACode(code: string): boolean {
@@ -487,9 +490,14 @@ aedes.authorizePublish = (client, packet, callback) => {
     
     // Check if this is the special "test" region and normalize it to lowercase
     const isTestRegion = locationCode.toLowerCase() === 'test';
-    
-    if (isTestRegion) {
-      console.log(`${logPrefix} [AUTHZ] ✓ Using test region -> ${packet.topic}`);
+    // Non-IATA stream-region labels (wardriver/hunter) are valid publish regions
+    // too: they carry sensitive purpose-collected streams that must stay separable
+    // from regional observer traffic, so they skip IATA validation but keep every
+    // other check (pubkey match, normalization). Kept lowercase.
+    const isStreamRegion = !isTestRegion && EXTRA_PUBLISH_REGIONS.has(locationCode.toLowerCase());
+
+    if (isTestRegion || isStreamRegion) {
+      console.log(`${logPrefix} [AUTHZ] ✓ Using ${isTestRegion ? 'test' : 'stream'} region -> ${packet.topic}`);
       // Continue to validation, don't return here
     } else {
       // First check format (must be 3 uppercase letters, no normalization)
@@ -547,7 +555,11 @@ aedes.authorizePublish = (client, packet, callback) => {
     // Normalize the topic to UPPERCASE for IATA codes and public key component
     // This prevents duplicate topics with different casing (e.g., 7553b337... vs 7553B337...)
     // For the test region, always normalize to lowercase "test"
-    const normalizedLocation = isTestRegion ? 'test' : locationCode.toUpperCase();
+    const normalizedLocation = isTestRegion
+      ? 'test'
+      : isStreamRegion
+        ? locationCode.toLowerCase()
+        : locationCode.toUpperCase();
     const normalizedTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/${topicParts.slice(3).join('/')}`;
     
     // Update the packet topic to the normalized version
@@ -781,7 +793,16 @@ aedes.authorizeForward = (client, packet) => {
       return null; // Block delivery of this message
     }
   }
-  
+
+  // Block /wardriver/* topics for LIMITED subscribers. The wardriver stream is
+  // realtime location of identified operators (sensitive), so only FULL_ACCESS and
+  // ADMIN receive it; a LIMITED subscriber never does.
+  if (clientType === ClientType.SUBSCRIBER && role === SubscriberRole.LIMITED) {
+    if (packet.topic.includes('/wardriver/')) {
+      return null; // Block delivery of this message
+    }
+  }
+
   // Prevent stale status messages from overwriting newer ones (LWT race condition)
   if (packet.topic.endsWith('/status') && packet.payload && packet.payload.length > 0) {
     try {
