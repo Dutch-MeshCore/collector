@@ -80,6 +80,9 @@ Edit `.env`:
 MQTT_WS_PORT=8883
 MQTT_HOST=0.0.0.0
 
+# Logging: debug | info | warn | error (unset = log everything, same as debug)
+LOG_LEVEL=info
+
 # Authentication Settings
 # Expected audience claim in JWT tokens (leave empty to skip validation)
 AUTH_EXPECTED_AUDIENCE=mqtt.yourdomain.com
@@ -92,6 +95,8 @@ SUBSCRIBER_1=admin:your-secure-password-here:1
 SUBSCRIBER_2=viewer:another-secure-password:2
 SUBSCRIBER_3=monitor:yet-another-password:3
 ```
+
+**Log level**: `LOG_LEVEL` is optional. Unset (or `debug`) logs everything. At `info` the per-connection and per-publish chatter (stream open/close, publish authorized, PING/PONG, connection details) is suppressed, while denials, disconnect reasons, abuse events, warnings and errors stay. At `warn` and `error` only warnings and errors are printed. The raw JWT of a login attempt is logged only at `debug`, so avoid `debug` in production.
 
 **Subscribe-only users** can read messages but cannot publish. They're useful for monitoring, debugging, and administrative dashboards.
 

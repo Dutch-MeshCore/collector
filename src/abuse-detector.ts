@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import Database from 'better-sqlite3';
+import { logInfo } from './logger';
 
 // Cap the per-client anomaly log. Without a bound, chronically noisy clients
 // accumulate multi-MB logs that the synchronous 5-minute save cycle must
@@ -215,6 +216,9 @@ export class AbuseDetector {
   private clients: Map<string, ClientTrustState> = new Map();
   private db: Database.Database;
   private persistenceInterval?: NodeJS.Timeout;
+  private upsertStmt!: Database.Statement;
+  private deleteStmt!: Database.Statement;
+  private sweepStmt!: Database.Statement;
   
   // Global stats
   private stats = {
@@ -228,15 +232,26 @@ export class AbuseDetector {
     
     // Initialize SQLite database
     this.db = new Database(config.persistencePath);
+    // WAL + synchronous=NORMAL: commits no longer fsync the main DB file each time, so the
+    // periodic save does not stall the event loop. Worst case after a power loss is losing the
+    // last few seconds of trust state, which is acceptable for this data.
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
     this.initDatabase();
     this.loadFromDatabase();
     
     // Start periodic persistence
     this.persistenceInterval = setInterval(() => {
-      this.saveToDatabase();
+      // A failed tick must only be logged: an exception escaping a timer callback would
+      // otherwise kill the whole broker process.
+      try {
+        this.saveToDatabase();
+      } catch (error) {
+        console.error('[ABUSE] Periodic save failed:', error);
+      }
     }, config.persistenceIntervalMs);
     
-    console.log(`[ABUSE] Initialized with persistence at: ${config.persistencePath}`);
+    logInfo(`[ABUSE] Initialized with persistence at: ${config.persistencePath}`);
   }
 
   private initDatabase(): void {
@@ -251,6 +266,14 @@ export class AbuseDetector {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_updated_at ON trust_states(updated_at)
     `);
+
+    // Prepared once and reused by every save.
+    this.upsertStmt = this.db.prepare(`
+      INSERT OR REPLACE INTO trust_states (public_key, state_json, updated_at)
+      VALUES (?, ?, ?)
+    `);
+    this.deleteStmt = this.db.prepare('DELETE FROM trust_states WHERE public_key = ?');
+    this.sweepStmt = this.db.prepare('DELETE FROM trust_states WHERE updated_at < ?');
   }
 
   private loadFromDatabase(): void {
@@ -275,46 +298,44 @@ export class AbuseDetector {
       }
     }
 
-    console.log(`[ABUSE] Loaded ${loaded} trust states from database`);
+    logInfo(`[ABUSE] Loaded ${loaded} trust states from database`);
   }
 
   private saveToDatabase(): void {
-    const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO trust_states (public_key, state_json, updated_at)
-      VALUES (?, ?, ?)
-    `);
-
-    const del = this.db.prepare('DELETE FROM trust_states WHERE public_key = ?');
     const now = Date.now();
     const cutoff = now - this.config.stateRetentionMs;
     let saved = 0;
     let evicted = 0;
 
-    for (const [publicKey, state] of this.clients.entries()) {
-      // Evict clients idle beyond the retention window from memory and disk so the store stays
-      // bounded by active clients rather than every client ever seen.
-      if (state.lastPacketAt < cutoff) {
-        this.clients.delete(publicKey);
-        del.run(publicKey);
-        evicted++;
-        continue;
+    // One transaction for the whole save: a single commit instead of one per client.
+    const saveAll = this.db.transaction(() => {
+      for (const [publicKey, state] of this.clients.entries()) {
+        // Evict clients idle beyond the retention window from memory and disk so the store stays
+        // bounded by active clients rather than every client ever seen.
+        if (state.lastPacketAt < cutoff) {
+          this.clients.delete(publicKey);
+          this.deleteStmt.run(publicKey);
+          evicted++;
+          continue;
+        }
+        try {
+          const serialized = this.serializeTrustState(state);
+          // Persist the client's real last-activity time as updated_at so retention (load filter
+          // and the delete below) is driven by activity, not by when the row was last written.
+          this.upsertStmt.run(publicKey, JSON.stringify(serialized), state.lastPacketAt);
+          saved++;
+        } catch (error) {
+          console.error(`[ABUSE] Failed to save trust state for ${publicKey}:`, error);
+        }
       }
-      try {
-        const serialized = this.serializeTrustState(state);
-        // Persist the client's real last-activity time as updated_at so retention (load filter
-        // and the delete below) is driven by activity, not by when the row was last written.
-        stmt.run(publicKey, JSON.stringify(serialized), state.lastPacketAt);
-        saved++;
-      } catch (error) {
-        console.error(`[ABUSE] Failed to save trust state for ${publicKey}:`, error);
-      }
-    }
 
-    // Sweep any orphaned rows for clients not currently tracked in memory (bounds disk).
-    this.db.prepare('DELETE FROM trust_states WHERE updated_at < ?').run(cutoff);
+      // Sweep any orphaned rows for clients not currently tracked in memory (bounds disk).
+      this.sweepStmt.run(cutoff);
+    });
+    saveAll();
 
     if (saved > 0 || evicted > 0) {
-      console.log(`[ABUSE] Saved ${saved} trust states to database (evicted ${evicted} stale)`);
+      logInfo(`[ABUSE] Saved ${saved} trust states to database (evicted ${evicted} stale)`);
     }
   }
 
@@ -407,15 +428,19 @@ export class AbuseDetector {
   }
 
   public shutdown(): void {
-    console.log('[ABUSE] Shutting down, saving final state...');
-    this.saveToDatabase();
+    logInfo('[ABUSE] Shutting down, saving final state...');
+    try {
+      this.saveToDatabase();
+    } catch (error) {
+      console.error('[ABUSE] Final save failed:', error);
+    }
     
     if (this.persistenceInterval) {
       clearInterval(this.persistenceInterval);
     }
     
     this.db.close();
-    console.log('[ABUSE] Shutdown complete');
+    logInfo('[ABUSE] Shutdown complete');
   }
 
   // ============================================================================
@@ -425,7 +450,7 @@ export class AbuseDetector {
   public initializeClient(publicKey: string, username: string, clientIP?: string): void {
     if (this.clients.has(publicKey)) {
       const existing = this.clients.get(publicKey)!;
-      console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Client reconnected (status: ${existing.status})`);
+      logInfo(`[ABUSE] [${publicKey.substring(0, 8)}] Client reconnected (status: ${existing.status})`);
       existing.connectedAt = Date.now();
       
       // Update IP tracking
@@ -487,7 +512,7 @@ export class AbuseDetector {
       this.recordIP(state, clientIP);
     }
     
-    console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Initialized trust tracking`);
+    logInfo(`[ABUSE] [${publicKey.substring(0, 8)}] Initialized trust tracking`);
   }
 
   private recordIP(state: ClientTrustState, ip: string): void {
@@ -599,7 +624,7 @@ export class AbuseDetector {
         
         // LoRa max packet size is ~255 bytes, anything beyond is suspicious
         if (rawByteSize > this.config.maxPacketSize) {
-          console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Anomalous raw packet size: ${rawByteSize} bytes (hex: ${message.raw.length} chars)`);
+          logInfo(`[ABUSE] [${publicKey.substring(0, 8)}] Anomalous raw packet size: ${rawByteSize} bytes (hex: ${message.raw.length} chars)`);
           this.recordAnomaly(state, 'packet_size', `Raw packet size ${rawByteSize} bytes exceeds limit ${this.config.maxPacketSize}`);
         }
       }
@@ -609,7 +634,7 @@ export class AbuseDetector {
 
     // Check rate limit
     if (!this.checkRateLimit(state)) {
-      console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Rate limit exceeded`);
+      logInfo(`[ABUSE] [${publicKey.substring(0, 8)}] Rate limit exceeded`);
       this.muteClient(state, 'rate_limit_exceeded');
       return false;
     }
@@ -617,7 +642,7 @@ export class AbuseDetector {
     // Check for duplicates
     const payload = packet.payload.toString();
     if (!this.checkDuplicates(state, payload)) {
-      console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Duplicate packet detected`);
+      logInfo(`[ABUSE] [${publicKey.substring(0, 8)}] Duplicate packet detected`);
       return false;
     }
 
@@ -761,7 +786,7 @@ export class AbuseDetector {
         // New IATA
         state.iataChangeCount24h = state.iataHistory.length + 1;
         
-        console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] IATA change detected (${state.currentIata} -> ${iata}, total: ${state.iataChangeCount24h}/${this.config.maxIataChanges24h} in 24h)`);
+        logInfo(`[ABUSE] [${state.publicKey.substring(0, 8)}] IATA change detected (${state.currentIata} -> ${iata}, total: ${state.iataChangeCount24h}/${this.config.maxIataChanges24h} in 24h)`);
         
         if (state.iataChangeCount24h > this.config.maxIataChanges24h) {
           this.muteClient(state, `iata_changes_exceeded (${state.iataChangeCount24h} changes in 24h)`);
@@ -816,7 +841,7 @@ export class AbuseDetector {
       state.anomalies.shift();
     }
 
-    console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] Anomaly: ${type} - ${details}`);
+    logInfo(`[ABUSE] [${state.publicKey.substring(0, 8)}] Anomaly: ${type} - ${details}`);
 
     if (state.anomalyCount >= this.config.anomalyThreshold) {
       this.muteClient(state, `anomaly_threshold_exceeded (${state.anomalyCount} anomalies)`);
@@ -834,9 +859,9 @@ export class AbuseDetector {
       state.mutedAt = Date.now();
       state.muteReason = reason;
       this.stats.totalClientsMuted++;
-      console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] MUTED (reason: ${reason})`);
+      logInfo(`[ABUSE] [${state.publicKey.substring(0, 8)}] MUTED (reason: ${reason})`);
     } else {
-      console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] WOULD MUTE (reason: ${reason}) [enforcement disabled]`);
+      logInfo(`[ABUSE] [${state.publicKey.substring(0, 8)}] WOULD MUTE (reason: ${reason}) [enforcement disabled]`);
     }
   }
 }

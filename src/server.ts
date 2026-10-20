@@ -8,6 +8,20 @@ import { RateLimiter } from './rate-limiter';
 import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
 import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
+import { logDebug, logInfo, logWarn } from './logger';
+
+// Last-resort crash visibility. Without these, a throw from a timer or an unhandled promise
+// rejection kills the process with no usable stack trace in the container logs. We log the
+// full stack and still exit(1): the process state is unknown after an uncaught exception, so
+// continuing would be unsafe. The container restart policy brings the broker back.
+process.on('uncaughtException', (err, origin) => {
+  console.error(`[FATAL] Uncaught exception (${origin}):`, err instanceof Error ? err.stack || err : err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection:', reason instanceof Error ? reason.stack || reason : reason);
+  process.exit(1);
+});
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
@@ -166,24 +180,29 @@ function buildCollectorStatsPayload() {
 }
 
 function publishCollectorStats(): void {
-  const topic = getStatsTopic();
-  const payload = Buffer.from(JSON.stringify(buildCollectorStatsPayload()));
+  // Runs from a timer: a failed tick must be logged, never allowed to kill the process.
+  try {
+    const topic = getStatsTopic();
+    const payload = Buffer.from(JSON.stringify(buildCollectorStatsPayload()));
 
-  aedes.publish(
-    {
-      cmd: 'publish',
-      topic,
-      payload,
-      qos: 0,
-      retain: STATS_RETAIN,
-      dup: false,
-    },
-    (err) => {
-      if (err) {
-        console.error(`[STATS] Failed to publish stats to ${topic}:`, err);
+    aedes.publish(
+      {
+        cmd: 'publish',
+        topic,
+        payload,
+        qos: 0,
+        retain: STATS_RETAIN,
+        dup: false,
+      },
+      (err) => {
+        if (err) {
+          console.error(`[STATS] Failed to publish stats to ${topic}:`, err);
+        }
       }
-    }
-  );
+    );
+  } catch (error) {
+    console.error('[STATS] Failed to build/publish collector stats:', error);
+  }
 }
 
 let subscriberIndex = 1;
@@ -230,18 +249,18 @@ while (true) {
       [SubscriberRole.FULL_ACCESS]: 'full_access', 
       [SubscriberRole.LIMITED]: 'limited'
     };
-    console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
+    logInfo(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
   } else {
-    console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex}: ${subscriberEnvVar}`);
+    logWarn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex}: ${subscriberEnvVar}`);
   }
   
   subscriberIndex++;
 }
 
 if (subscriberUsers.size === 0) {
-  console.log('[CONFIG] No subscriber users configured');
+  logInfo('[CONFIG] No subscriber users configured');
 } else {
-  console.log(`[CONFIG] Default max connections per subscriber: ${subscriberConfig.defaultMaxConnections}`);
+  logInfo(`[CONFIG] Default max connections per subscriber: ${subscriberConfig.defaultMaxConnections}`);
 }
 
 // Create Aedes MQTT broker
@@ -269,7 +288,7 @@ function getClientLogPrefix(client: any): string {
 // Authentication handler
 aedes.authenticate = async (client, username, password, callback) => {
   const logPrefix = `[C:${client.id}]`;
-  console.log(`${logPrefix} [AUTH] Authentication attempt - Username: ${username}`);
+  logInfo(`${logPrefix} [AUTH] Authentication attempt - Username: ${username}`);
 
   try {
     const usernameStr = username?.toString() || '';
@@ -284,7 +303,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         const activeConns = subscriberActiveConnections.get(usernameStr) || new Set();
         
         if (activeConns.size >= maxConn) {
-          console.log(`${logPrefix} [AUTH] ✗ Subscriber connection limit exceeded (${usernameStr}, ${activeConns.size}/${maxConn})`);
+          logInfo(`${logPrefix} [AUTH] ✗ Subscriber connection limit exceeded (${usernameStr}, ${activeConns.size}/${maxConn})`);
           callback(null, false);
           return;
         }
@@ -294,7 +313,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         subscriberActiveConnections.set(usernameStr, activeConns);
         
         const role = subscriberRoles.get(usernameStr) || SubscriberRole.LIMITED;
-        console.log(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role}, connections: ${activeConns.size}/${maxConn})`);
+        logInfo(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role}, connections: ${activeConns.size}/${maxConn})`);
         (client as any).clientType = ClientType.SUBSCRIBER;
         (client as any).username = usernameStr;
         (client as any).role = role;
@@ -316,7 +335,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         
         callback(null, true);
       } else {
-        console.log(`${logPrefix} [AUTH] ✗ Subscriber authentication failed - Invalid password`);
+        logInfo(`${logPrefix} [AUTH] ✗ Subscriber authentication failed - Invalid password`);
         callback(null, false);
       }
       return;
@@ -325,7 +344,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Otherwise, check for JWT-based publisher authentication
     // Username format: v1_{UPPERCASE_PUBLIC_KEY}
     if (!usernameStr.startsWith('v1_')) {
-      console.log(`${logPrefix} [AUTH] ✗ Invalid username format: ${usernameStr}`);
+      logInfo(`${logPrefix} [AUTH] ✗ Invalid username format: ${usernameStr}`);
       callback(null, false);
       return;
     }
@@ -334,41 +353,41 @@ aedes.authenticate = async (client, username, password, callback) => {
     
     // Validate public key format (should be 64 hex characters)
     if (!/^[0-9A-F]{64}$/i.test(publicKey)) {
-      console.log(`${logPrefix} [AUTH] ✗ Invalid public key format: ${publicKey}`);
-      console.log(`${logPrefix} [AUTH] Public key length: ${publicKey.length}, hex dump: ${Buffer.from(publicKey).toString('hex')}`);
+      logInfo(`${logPrefix} [AUTH] ✗ Invalid public key format: ${publicKey}`);
+      logInfo(`${logPrefix} [AUTH] Public key length: ${publicKey.length}, hex dump: ${Buffer.from(publicKey).toString('hex')}`);
       callback(null, false);
       return;
     }
 
     if (!passwordStr || passwordStr.length === 0) {
-      console.log(`${logPrefix} [AUTH] ✗ No password provided`);
+      logInfo(`${logPrefix} [AUTH] ✗ No password provided`);
       callback(null, false);
       return;
     }
 
     // Verify the auth token using meshcore-decoder
     const tokenPayload = await verifyAuthToken(passwordStr, publicKey);
-    console.debug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);
+    logDebug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);
 
     
     if (!tokenPayload) {
-      console.log(`${logPrefix} [AUTH] ✗ Invalid token signature`);
-      console.debug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);      
-      console.debug(`${logPrefix} [AUTH] Public key: ${publicKey}`);
-      console.debug(`${logPrefix} [AUTH] Token hex: ${Buffer.from(passwordStr).toString('hex')}`);
+      logInfo(`${logPrefix} [AUTH] ✗ Invalid token signature`);
+      logDebug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);      
+      logDebug(`${logPrefix} [AUTH] Public key: ${publicKey}`);
+      logDebug(`${logPrefix} [AUTH] Token hex: ${Buffer.from(passwordStr).toString('hex')}`);
       callback(null, false);
       return;
     }
     
     // Validate audience claim if configured
     if (EXPECTED_AUDIENCE && tokenPayload.aud !== EXPECTED_AUDIENCE) {
-      console.log(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected: ${EXPECTED_AUDIENCE})`);
+      logInfo(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected: ${EXPECTED_AUDIENCE})`);
       callback(null, false);
       return;
     }
     
     const shortKey = publicKey.substring(0, 8);
-    console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
+    logInfo(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
     // Store the public key and client type with the client for later use
     (client as any).publicKey = publicKey;
     (client as any).tokenPayload = tokenPayload;
@@ -412,7 +431,7 @@ aedes.authorizePublish = (client, packet, callback) => {
   // Important: Strip retain flag from /status messages to prevent stale data on ingestor restart
   // LWT (offline) messages are also STATUS messages and should NOT be retained
   if (packet.topic.endsWith('/status') && packet.retain) {
-    console.log(`${logPrefix} [AUTHZ] Stripping retain flag from STATUS message -> ${packet.topic}`);
+    logInfo(`${logPrefix} [AUTHZ] Stripping retain flag from STATUS message -> ${packet.topic}`);
     packet.retain = false;
   }
   
@@ -422,7 +441,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     
     // Admin subscribers (role 1) can publish empty retained messages to delete them
     if (role === SubscriberRole.ADMIN && packet.retain && packet.payload.length === 0) {
-      console.log(`${logPrefix} [AUTHZ] ✓ Admin delete authorized -> ${packet.topic}`);
+      logInfo(`${logPrefix} [AUTHZ] ✓ Admin delete authorized -> ${packet.topic}`);
       callback(null);
       return;
     }
@@ -439,17 +458,17 @@ aedes.authorizePublish = (client, packet, callback) => {
         const isValidIata = /^[A-Z]{3}$/i.test(iata) || iata.toLowerCase() === 'test';
         const isValidPubKey = /^[0-9A-Fa-f]{64}$/.test(publicKey);
         if (isValidIata && isValidPubKey) {
-          console.log(`${logPrefix} [AUTHZ] ✓ Admin serial command authorized -> ${packet.topic}`);
+          logInfo(`${logPrefix} [AUTHZ] ✓ Admin serial command authorized -> ${packet.topic}`);
           callback(null);
           return;
         }
       }
-      console.log(`${logPrefix} [AUTHZ] ✗ Serial command denied (invalid topic format) -> ${packet.topic}`);
+      logInfo(`${logPrefix} [AUTHZ] ✗ Serial command denied (invalid topic format) -> ${packet.topic}`);
       callback(new Error('Invalid serial/commands topic format'));
       return;
     }
     
-    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied (subscriber) -> ${packet.topic}`);
+    logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied (subscriber) -> ${packet.topic}`);
     callback(new Error('Subscriber clients are subscribe-only'));
     return;
   }
@@ -457,7 +476,7 @@ aedes.authorizePublish = (client, packet, callback) => {
   // Publisher clients can only publish to meshcore/* topics
   if (clientType === ClientType.PUBLISHER) {
     if (!packet.topic.startsWith('meshcore/')) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (not meshcore/*)`);
+      logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (not meshcore/*)`);
       callback(new Error('Publishers can only publish to meshcore/* topics'));
       return;
     }
@@ -470,7 +489,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     //   meshcore/SEA/ABCD1234.../internal (ADMIN only)
     const topicParts = packet.topic.split('/').map(part => part.trim());
     if (topicParts.length < 4) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (must be meshcore/IATA/PUBKEY/subtopic format)`);
+      logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (must be meshcore/IATA/PUBKEY/subtopic format)`);
       callback(new Error('Topic must be meshcore/IATA/PUBKEY/subtopic format (4 parts required)'));
       return;
     }
@@ -480,9 +499,9 @@ aedes.authorizePublish = (client, packet, callback) => {
     
     // Reject XXX explicitly (default placeholder value)
     if (locationCode === 'XXX') {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (XXX not valid, configure actual IATA)`);
-      console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location code: XXX`);
-      console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+      logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (XXX not valid, configure actual IATA)`);
+      logInfo(`${logPrefix} [DISCONNECT] Closing client - Invalid location code: XXX`);
+      logInfo(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
       callback(new Error('XXX is a placeholder - please configure your actual IATA location code'));
       client.close();
       return;
@@ -497,16 +516,16 @@ aedes.authorizePublish = (client, packet, callback) => {
     const isStreamRegion = !isTestRegion && EXTRA_PUBLISH_REGIONS.has(locationCode.toLowerCase());
 
     if (isTestRegion || isStreamRegion) {
-      console.log(`${logPrefix} [AUTHZ] ✓ Using ${isTestRegion ? 'test' : 'stream'} region -> ${packet.topic}`);
+      logInfo(`${logPrefix} [AUTHZ] ✓ Using ${isTestRegion ? 'test' : 'stream'} region -> ${packet.topic}`);
       // Continue to validation, don't return here
     } else {
       // First check format (must be 3 uppercase letters, no normalization)
       if (!iataRegex.test(locationCode)) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid format)`);
-        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location format`);
-        console.log(`${logPrefix} [DISCONNECT] Location code: "${locationCode}" (length: ${locationCode.length})`);
-        console.log(`${logPrefix} [DISCONNECT] Location hex: ${Buffer.from(locationCode).toString('hex')}`);
-        console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+        logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid format)`);
+        logInfo(`${logPrefix} [DISCONNECT] Closing client - Invalid location format`);
+        logInfo(`${logPrefix} [DISCONNECT] Location code: "${locationCode}" (length: ${locationCode.length})`);
+        logInfo(`${logPrefix} [DISCONNECT] Location hex: ${Buffer.from(locationCode).toString('hex')}`);
+        logInfo(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
         callback(new Error('Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"'));
         client.close();
         return;
@@ -514,10 +533,10 @@ aedes.authorizePublish = (client, packet, callback) => {
       
       // Then check if it's a valid IATA code
       if (!isValidIATACode(locationCode)) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid IATA)`);
-        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code`);
-        console.log(`${logPrefix} [DISCONNECT] Location code: "${locationCode}"`);
-        console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+        logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid IATA)`);
+        logInfo(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code`);
+        logInfo(`${logPrefix} [DISCONNECT] Location code: "${locationCode}"`);
+        logInfo(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
         callback(new Error('Location must be a valid IATA international airport code or "test"'));
         client.close();
         return;
@@ -529,11 +548,11 @@ aedes.authorizePublish = (client, packet, callback) => {
     
     // Validate it looks like a public key (64 hex chars)
     if (!/^[0-9A-F]{64}$/i.test(topicPublicKey)) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid pubkey format)`);
-      console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid public key format in topic`);
-      console.log(`${logPrefix} [DISCONNECT] Topic pubkey: "${topicPublicKey}" (length: ${topicPublicKey.length})`);
-      console.log(`${logPrefix} [DISCONNECT] Topic pubkey hex: ${Buffer.from(topicPublicKey).toString('hex')}`);
-      console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+      logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid pubkey format)`);
+      logInfo(`${logPrefix} [DISCONNECT] Closing client - Invalid public key format in topic`);
+      logInfo(`${logPrefix} [DISCONNECT] Topic pubkey: "${topicPublicKey}" (length: ${topicPublicKey.length})`);
+      logInfo(`${logPrefix} [DISCONNECT] Topic pubkey hex: ${Buffer.from(topicPublicKey).toString('hex')}`);
+      logInfo(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
       callback(new Error('Public key in topic must be 64 hex characters'));
       client.close();
       return;
@@ -542,11 +561,11 @@ aedes.authorizePublish = (client, packet, callback) => {
     // Validate topic public key matches authenticated client
     const clientPublicKey = (client as any).publicKey.toUpperCase();
     if (topicPublicKey !== clientPublicKey) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (pubkey mismatch)`);
-      console.log(`${logPrefix} [DISCONNECT] Closing client - Public key mismatch`);
-      console.log(`${logPrefix} [DISCONNECT] Topic pubkey:  "${topicPublicKey}"`);
-      console.log(`${logPrefix} [DISCONNECT] Client pubkey: "${clientPublicKey}"`);
-      console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+      logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (pubkey mismatch)`);
+      logInfo(`${logPrefix} [DISCONNECT] Closing client - Public key mismatch`);
+      logInfo(`${logPrefix} [DISCONNECT] Topic pubkey:  "${topicPublicKey}"`);
+      logInfo(`${logPrefix} [DISCONNECT] Client pubkey: "${clientPublicKey}"`);
+      logInfo(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
       callback(new Error('Public key in topic must match authenticated public key'));
       client.close();
       return;
@@ -564,7 +583,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     
     // Update the packet topic to the normalized version
     if (packet.topic !== normalizedTopic) {
-      console.log(`${logPrefix} [AUTHZ] Normalized topic: ${packet.topic} -> ${normalizedTopic}`);
+      logInfo(`${logPrefix} [AUTHZ] Normalized topic: ${packet.topic} -> ${normalizedTopic}`);
       packet.topic = normalizedTopic;
     }
 
@@ -576,18 +595,18 @@ aedes.authorizePublish = (client, packet, callback) => {
       // Validate it looks like a JWT (3 base64url parts separated by dots)
       const jwtParts = payload.split('.');
       if (jwtParts.length !== 3) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT format)`);
+        logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT format)`);
         callback(new Error('serial/responses payload must be a valid JWT'));
         return;
       }
       // Basic JWT format check - each part should be base64url encoded
       const base64urlRegex = /^[A-Za-z0-9_-]+$/;
       if (!jwtParts.every(part => base64urlRegex.test(part))) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT encoding)`);
+        logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT encoding)`);
         callback(new Error('serial/responses payload must be a valid JWT'));
         return;
       }
-      console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized (serial response) -> ${packet.topic}`);
+      logDebug(`${logPrefix} [AUTHZ] ✓ Publish authorized (serial response) -> ${packet.topic}`);
       callback(null);
       return;
     }
@@ -598,7 +617,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       const message = JSON.parse(payload);
       
       if (!message.origin_id) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing origin_id)`);
+        logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing origin_id)`);
         callback(new Error('Message must contain origin_id field'));
         return;
       }
@@ -608,7 +627,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       const normalizedClientKey = clientPublicKey.toUpperCase();
       
       if (messageOriginId !== normalizedClientKey) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (origin_id mismatch)`);
+        logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (origin_id mismatch)`);
         callback(new Error('origin_id must match authenticated public key'));
         return;
       }
@@ -626,7 +645,7 @@ aedes.authorizePublish = (client, packet, callback) => {
         abuseDetector.recordPacket(client, packet);
       }
       
-      console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized -> ${packet.topic}`);
+      logDebug(`${logPrefix} [AUTHZ] ✓ Publish authorized -> ${packet.topic}`);
       
       // Publish JWT payload to /internal topic (ADMIN-only, contains PII)
       const tokenPayload = (client as any).tokenPayload;
@@ -698,21 +717,21 @@ aedes.authorizePublish = (client, packet, callback) => {
           if (err) {
             console.error(`${logPrefix} [INTERNAL] Failed to publish JWT payload:`, err);
           } else {
-            console.log(`${logPrefix} [INTERNAL] Published JWT payload -> ${internalTopic}`);
+            logDebug(`${logPrefix} [INTERNAL] Published JWT payload -> ${internalTopic}`);
           }
         });
       }
       
       callback(null);
     } catch (error) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JSON or validation error)`);
+      logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JSON or validation error)`);
       callback(new Error('Invalid message format or origin_id validation failed'));
     }
     return;
   }
   
   // Unknown client type
-  console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (unknown client type)`);
+  logInfo(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (unknown client type)`);
   callback(new Error('Unknown client type'));
 };
 
@@ -736,14 +755,14 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
         const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
         // Publisher can only subscribe to their OWN serial/commands topic
         if (topicPublicKey === clientPublicKey && clientPublicKey.length === 64) {
-          console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized (own serial/commands) -> ${subscription.topic}`);
+          logInfo(`${logPrefix} [AUTHZ] ✓ Subscribe authorized (own serial/commands) -> ${subscription.topic}`);
           callback(null, subscription);
           return;
         }
       }
     }
-    console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (publisher) -> ${subscription.topic}`);
-    console.log(`${logPrefix} [DISCONNECT] Closing client - Publishers cannot subscribe`);
+    logInfo(`${logPrefix} [AUTHZ] ✗ Subscribe denied (publisher) -> ${subscription.topic}`);
+    logInfo(`${logPrefix} [DISCONNECT] Closing client - Publishers cannot subscribe`);
     callback(new Error('Publisher clients are publish-only'));
     client.close();
     return;
@@ -751,13 +770,13 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
   
   // Subscriber clients can subscribe to any topic (they're listeners)
   if (clientType === ClientType.SUBSCRIBER) {
-    console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized -> ${subscription.topic}`);
+    logInfo(`${logPrefix} [AUTHZ] ✓ Subscribe authorized -> ${subscription.topic}`);
     callback(null, subscription);
     return;
   }
   
   // Unknown client type
-  console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${subscription.topic} (unknown client type)`);
+  logInfo(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${subscription.topic} (unknown client type)`);
   callback(new Error('Unknown client type'));
 };
 
@@ -815,7 +834,7 @@ aedes.authorizeForward = (client, packet) => {
         
         if (timestamp < lastTimestamp) {
           // This is a stale status message (probably a delayed LWT)
-          console.log(`[FILTER] Blocking stale status message for ${originId.substring(0, 8)} (${new Date(timestamp).toISOString()} < ${new Date(lastTimestamp).toISOString()})`);
+          logInfo(`[FILTER] Blocking stale status message for ${originId.substring(0, 8)} (${new Date(timestamp).toISOString()} < ${new Date(lastTimestamp).toISOString()})`);
           return null; // Block this stale message
         }
         
@@ -824,7 +843,7 @@ aedes.authorizeForward = (client, packet) => {
       }
     } catch (error) {
       // If parsing fails, let it through (don't block non-JSON status messages)
-      console.debug(`[FILTER] Failed to parse status message for timestamp check:`, error);
+      logDebug(`[FILTER] Failed to parse status message for timestamp check:`, error);
     }
   }
   
@@ -865,7 +884,7 @@ aedes.authorizeForward = (client, packet) => {
         }
       } catch (error) {
         // If JSON parsing fails, just return the original packet
-        console.debug(`[FILTER] Failed to parse status message for filtering:`, error);
+        logDebug(`[FILTER] Failed to parse status message for filtering:`, error);
       }
     }
     
@@ -898,7 +917,7 @@ aedes.authorizeForward = (client, packet) => {
         }
       } catch (error) {
         // If JSON parsing fails, just return the original packet
-        console.debug(`[FILTER] Failed to parse packet message for filtering:`, error);
+        logDebug(`[FILTER] Failed to parse packet message for filtering:`, error);
       }
     }
   }
@@ -913,8 +932,8 @@ aedes.on('client', (client) => {
   (client as any).stream = (client as any).conn;
   
   const logPrefix = getClientLogPrefix(client);
-  console.log(`${logPrefix} [CLIENT] Connected`);
-  console.log(`${logPrefix} [CLIENT] Connection details - conn exists: ${!!(client as any).conn}, clientIP: ${(client as any).conn?.clientIP}`);
+  logInfo(`${logPrefix} [CLIENT] Connected`);
+  logDebug(`${logPrefix} [CLIENT] Connection details - conn exists: ${!!(client as any).conn}, clientIP: ${(client as any).conn?.clientIP}`);
   
   // Track when this client connected for disconnect timing
   (client as any).connectedAt = Date.now();
@@ -926,12 +945,12 @@ aedes.on('client', (client) => {
     const originalDestroy = stream.destroy?.bind(stream);
     
     (stream as any).close = function(...args: any[]) {
-      console.log(`${logPrefix} [STREAM] close() called (server-initiated close)`);
+      logDebug(`${logPrefix} [STREAM] close() called (server-initiated close)`);
       if (originalClose) originalClose(...args);
     };
     
     (stream as any).destroy = function(...args: any[]) {
-      console.log(`${logPrefix} [STREAM] destroy() called - error: ${args[0]?.message || 'none'}`);
+      logDebug(`${logPrefix} [STREAM] destroy() called - error: ${args[0]?.message || 'none'}`);
       if (originalDestroy) originalDestroy(...args);
     };
   }
@@ -942,11 +961,11 @@ aedes.on('clientDisconnect', (client) => {
   const connectedAt = (client as any).connectedAt;
   const duration = connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : 'unknown';
   
-  console.log(`${logPrefix} [CLIENT] Disconnected (connected for ${duration}s)`);
+  logInfo(`${logPrefix} [CLIENT] Disconnected (connected for ${duration}s)`);
   
   // Log additional info to debug why this client disconnected
   if (client) {
-    console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
+    logDebug(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
     
     // Clean up subscriber connection tracking
     const clientType = (client as any).clientType;
@@ -956,7 +975,7 @@ aedes.on('clientDisconnect', (client) => {
       if (activeConns) {
         activeConns.delete(client.id);
         const maxConn = subscriberMaxConnections.get(username) || subscriberConfig.defaultMaxConnections;
-        console.log(`${logPrefix} [CLIENT] Subscriber connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
+        logInfo(`${logPrefix} [CLIENT] Subscriber connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
       }
       connectedSubscribers.delete(client.id);
     }
@@ -970,7 +989,7 @@ aedes.on('clientDisconnect', (client) => {
 aedes.on('publish', (packet, client) => {
   if (client) {
     const logPrefix = getClientLogPrefix(client);
-    console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
+    logDebug(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
 
     const clientType = (client as any).clientType;
     if (clientType === ClientType.PUBLISHER) {
@@ -985,34 +1004,59 @@ aedes.on('publish', (packet, client) => {
       }
     }
   } else {
-    console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
+    logDebug(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
   }
 });
 
 aedes.on('subscribe', (subscriptions, client) => {
   const logPrefix = getClientLogPrefix(client);
-  console.log(`${logPrefix} [SUBSCRIBE] Attempting to subscribe to: ${subscriptions.map(s => s.topic).join(', ')}`);
+  logInfo(`${logPrefix} [SUBSCRIBE] Attempting to subscribe to: ${subscriptions.map(s => s.topic).join(', ')}`);
 });
 
 // Log when client sends DISCONNECT packet (graceful disconnect)
 aedes.on('clientError', (client, err) => {
   const logPrefix = getClientLogPrefix(client);
-  console.log(`${logPrefix} [ERROR] Client error: ${err.message}`);
+  logInfo(`${logPrefix} [ERROR] Client error: ${err.message}`);
 });
 
 // Create HTTP server for WebSocket
 const httpServer = createServer((req, res) => {
   // If this is not a WebSocket upgrade request, redirect to the front-end.
   if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
-    console.log(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting to ${HTTP_REDIRECT_URL}`);
+    logInfo(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting to ${HTTP_REDIRECT_URL}`);
     res.writeHead(302, { 'Location': HTTP_REDIRECT_URL });
     res.end();
     return;
   }
 });
 
+// Server-level 'error' events. Node emits accept() failures (EMFILE/ENFILE/ENOBUFS when the
+// process runs out of file descriptors or memory) as 'error' on the listening server; with no
+// listener that is an uncaught exception and the whole broker dies for what is a transient,
+// per-connection condition. Once listening we therefore log (throttled, as EMFILE can repeat in
+// a tight loop) and keep serving; the kernel retries accept on the next connection. Errors
+// before listening (EADDRINUSE, EACCES) mean the broker can never work, so those stay fatal.
+// The WebSocketServer re-emits every http server error, so a WeakSet avoids logging it twice.
+const loggedServerErrors = new WeakSet<object>();
+let lastServerErrorLogAt = 0;
+function handleServerError(source: string, error: NodeJS.ErrnoException): void {
+  if (!httpServer.listening) {
+    console.error(`[FATAL] ${source} error before listening:`, error.stack || error);
+    process.exit(1);
+  }
+  if (loggedServerErrors.has(error)) return;
+  loggedServerErrors.add(error);
+  const now = Date.now();
+  if (now - lastServerErrorLogAt >= 5000) {
+    lastServerErrorLogAt = now;
+    console.error(`[${source}] Server error (${error.code || 'unknown'}), continuing:`, error.message);
+  }
+}
+httpServer.on('error', (error) => handleServerError('HTTP', error));
+
 // Create WebSocket server
 const wsServer = new WebSocketServer({ server: httpServer });
+wsServer.on('error', (error) => handleServerError('WEBSOCKET', error));
 
 wsServer.on('connection', (ws, req) => {
   try {
@@ -1020,22 +1064,22 @@ wsServer.on('connection', (ws, req) => {
     
     // Check if IP is blocked
     if (rateLimiter.isBlocked(clientIP)) {
-      console.log(`[RATE_LIMIT] Rejecting connection from blocked IP: ${clientIP}`);
+      logInfo(`[RATE_LIMIT] Rejecting connection from blocked IP: ${clientIP}`);
       // Terminate immediately without trying to send a close frame
       ws.terminate();
       return;
     }
     
-    console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
+    logInfo(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
   
   // Enable WebSocket ping/pong to keep connection alive
   ws.on('ping', (data) => {
-    console.log(`[WEBSOCKET] Received WebSocket PING from ${clientIP}, sending PONG`);
+    logInfo(`[WEBSOCKET] Received WebSocket PING from ${clientIP}, sending PONG`);
     ws.pong(data);
   });
   
   ws.on('pong', () => {
-    console.log(`[WEBSOCKET] Received WebSocket PONG from ${clientIP}`);
+    logInfo(`[WEBSOCKET] Received WebSocket PONG from ${clientIP}`);
   });
   
   // Handle WebSocket errors
@@ -1056,9 +1100,9 @@ wsServer.on('connection', (ws, req) => {
           const clientInfo = (stream as any).client;
           if (clientInfo) {
             const logPrefix = getClientLogPrefix(clientInfo);
-            console.log(`${logPrefix} [MQTT] Sending PINGRESP (PONG) to client`);
+            logDebug(`${logPrefix} [MQTT] Sending PINGRESP (PONG) to client`);
           } else {
-            console.log(`[MQTT] Sending PINGRESP (PONG) to unauthenticated client`);
+            logDebug(`[MQTT] Sending PINGRESP (PONG) to unauthenticated client`);
           }
         }
         
@@ -1088,9 +1132,9 @@ wsServer.on('connection', (ws, req) => {
       const clientInfo = (stream as any).client;
       if (clientInfo) {
         const logPrefix = getClientLogPrefix(clientInfo);
-        console.log(`${logPrefix} [MQTT] Received PINGREQ (PING) from client`);
+        logDebug(`${logPrefix} [MQTT] Received PINGREQ (PING) from client`);
       } else {
-        console.log('[MQTT] Received PINGREQ (PING) from unauthenticated client');
+        logDebug('[MQTT] Received PINGREQ (PING) from unauthenticated client');
       }
     }
     stream.push(data);
@@ -1110,15 +1154,15 @@ wsServer.on('connection', (ws, req) => {
     
     if (hasValidAuth) {
       const logPrefix = getClientLogPrefix(clientInfo);
-      console.log(`${logPrefix} [WEBSOCKET] Connection closed from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
+      logInfo(`${logPrefix} [WEBSOCKET] Connection closed from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
     } else {
       // Unauthenticated or invalid client - count as failed connection
-      console.log(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
+      logInfo(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
       
       if (!wasAuthenticated) {
         const blocked = rateLimiter.recordFailure(clientIP);
         if (blocked) {
-          console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
+          logInfo(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
         }
       }
     }
@@ -1130,9 +1174,9 @@ wsServer.on('connection', (ws, req) => {
     const clientInfo = (stream as any).client;
     if (clientInfo) {
       const logPrefix = getClientLogPrefix(clientInfo);
-      console.log(`${logPrefix} [STREAM] Stream ended, closing WebSocket`);
+      logInfo(`${logPrefix} [STREAM] Stream ended, closing WebSocket`);
     } else {
-      console.log('[STREAM] Stream ended (unauthenticated), closing WebSocket');
+      logInfo('[STREAM] Stream ended (unauthenticated), closing WebSocket');
     }
     ws.close();
   });
@@ -1152,45 +1196,45 @@ wsServer.on('connection', (ws, req) => {
 setInterval(publishCollectorStats, STATS_INTERVAL_MS);
 setTimeout(publishCollectorStats, 1000);
 
-console.log(`[STATS] Publishing collector stats every ${STATS_INTERVAL_MS}ms to ${getStatsTopic()} (retain: ${STATS_RETAIN}, token details: ${STATS_INCLUDE_TOKEN_CLIENT_DETAILS})`);
+logInfo(`[STATS] Publishing collector stats every ${STATS_INTERVAL_MS}ms to ${getStatsTopic()} (retain: ${STATS_RETAIN}, token details: ${STATS_INCLUDE_TOKEN_CLIENT_DETAILS})`);
 
 httpServer.listen(WS_PORT, HOST, () => {
-  console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║         MeshCore MQTT Broker (WebSocket)                  ║');
-  console.log('╚════════════════════════════════════════════════════════════╝');
-  console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
-  console.log('');
-  console.log('Authentication Modes:');
-  console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
-  console.log('     Usernames:', Array.from(subscriberUsers.keys()).join(', '));
-  console.log('');
-  console.log('  2. Publishers (Publish-only):');
-  console.log('     Username: v1_{PUBLIC_KEY}');
-  console.log('     Password: JWT token signed with Ed25519 private key');
-  console.log('     Validation:');
-  console.log('       - origin_id must match authenticated public key');
+  logInfo('╔════════════════════════════════════════════════════════════╗');
+  logInfo('║         MeshCore MQTT Broker (WebSocket)                  ║');
+  logInfo('╚════════════════════════════════════════════════════════════╝');
+  logInfo(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
+  logInfo('');
+  logInfo('Authentication Modes:');
+  logInfo(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
+  logInfo('     Usernames:', Array.from(subscriberUsers.keys()).join(', '));
+  logInfo('');
+  logInfo('  2. Publishers (Publish-only):');
+  logInfo('     Username: v1_{PUBLIC_KEY}');
+  logInfo('     Password: JWT token signed with Ed25519 private key');
+  logInfo('     Validation:');
+  logInfo('       - origin_id must match authenticated public key');
   if (EXPECTED_AUDIENCE) {
-    console.log(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
+    logInfo(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
   }
-  console.log('');
-  console.log('Ready to accept connections...');
+  logInfo('');
+  logInfo('Ready to accept connections...');
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  logInfo('\n[SHUTDOWN] Closing MQTT broker...');
   abuseDetector.shutdown();
   aedes.close(() => {
-    console.log('[SHUTDOWN] Broker closed');
+    logInfo('[SHUTDOWN] Broker closed');
     process.exit(0);
   });
 });
 
 process.on('SIGTERM', () => {
-  console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  logInfo('\n[SHUTDOWN] Closing MQTT broker...');
   abuseDetector.shutdown();
   aedes.close(() => {
-    console.log('[SHUTDOWN] Broker closed');
+    logInfo('[SHUTDOWN] Broker closed');
     process.exit(0);
   });
 });
